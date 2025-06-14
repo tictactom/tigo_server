@@ -7,12 +7,14 @@
 #include <FS.h>
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
+#include <time.h>
 
 const char* hostname = "TigoServer";
 const char* ssid = ""; //SSID
 const char* password = ""; //passwort
 const char* MQTT_BROKER = ""; //MQTT Server IP
-
+const char* mqtt_user = "";
+const char* mqtt_pass = "";
 
 constexpr uint16_t POLYNOMIAL = 0x8408;  // Reversed polynomial (0x1021 reflected)
 constexpr size_t TABLE_SIZE = 256;
@@ -26,6 +28,13 @@ String incomingData = "";
 String completeFrame = "";
 char address_complete[50];
 char* address;
+
+void setupNTP();
+void setupWebserver();
+void loadNodeTable();
+void loopLogging();
+bool allBarcodesKnown();
+void saveNodeTable();
 
 struct DeviceData {
   String pv_node_id;
@@ -60,10 +69,6 @@ struct frame09Data {
 frame09Data frame09[100];
 int frame09_count = 0;
 
-
-
-
-
 WiFiClient espClient;
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
@@ -71,17 +76,11 @@ PubSubClient MQTT_Client(espClient);
 
 File uploadFile;
 
-
 unsigned long currentMillis = millis();
 unsigned long previousMillis = millis();
 unsigned long interval = 2000;
 
-
-
-
-
 const char crc_char_map[] = "GHJKLMNPRSTVWXYZ";
-
 const uint8_t crc_table[256] = {
   0x0,0x3,0x6,0x5,0xC,0xF,0xA,0x9,0xB,0x8,0xD,0xE,0x7,0x4,0x1,0x2,
   0x5,0x6,0x3,0x0,0x9,0xA,0xF,0xC,0xE,0xD,0x8,0xB,0x2,0x1,0x4,0x7,
@@ -103,23 +102,17 @@ const uint8_t crc_table[256] = {
 
 char computeTigoCRC4(const char* hexString) {
   uint8_t crc = 0x2;
-
   while (*hexString && *(hexString + 1)) {
     char byteStr[3] = { hexString[0], hexString[1], '\0' };
     uint8_t byteVal = strtoul(byteStr, NULL, 16);
     crc = crc_table[byteVal ^ (crc << 4)];
     hexString += 2;
   }
-
   return crc_char_map[crc];
 }
 
-
-
-
 void processFrame(String frame);
 String removeEscapeSequences(const String& frame);
-
 
 void hexStringToBytes(const String& hexString, uint8_t* byteArray, size_t length) {
   for (size_t i = 0; i < length; i++) {
@@ -143,13 +136,9 @@ void generateCRCTable() {
   }
 }
 
-
-
 // Function to compute CRC-16/CCITT using the precomputed table
 uint16_t computeCRC16CCITT(const uint8_t* data, size_t length) {
   uint16_t crc = 0x8408;  // Initial value
-
-
   for (size_t i = 0; i < length; i++) {
     uint8_t index = (crc ^ data[i]) & 0xFF;
     crc = (crc >> 8) ^ CRC_TABLE[index];
@@ -158,50 +147,39 @@ uint16_t computeCRC16CCITT(const uint8_t* data, size_t length) {
   return crc;  // Final XOR (inverted CRC as per CRC-16/CCITT spec)
 }
 
-
-
-
-
-
 bool verifyChecksum(const String& frame) {
   if (frame.length() < 2) return false;
-
   String checksumStr = frame.substring(frame.length() - 2);
   uint16_t extractedChecksum = (checksumStr[0] << 8) | checksumStr[1];
-
   uint16_t computedChecksum = computeCRC16CCITT((const uint8_t*)frame.c_str(), frame.length() - 2);
-
   return extractedChecksum == computedChecksum;
 }
-
-
 
 void WebsocketSend(bool send_all = false) {
   StaticJsonDocument<8192> doc; 
   JsonArray array = doc.to<JsonArray>();
-
   for (int i = 0; i < deviceCount; i++) {
     if (devices[i].changed || send_all == true) {
       DeviceData& d = devices[i];
-
       JsonObject obj = array.createNestedObject();
-      obj["id"] = d.barcode.substring(11);
-      obj["watt"] = round(d.voltage_in * d.current_in);
-      obj["volt"] = String(d.voltage_in, 1);
-      obj["amp"]  = String(d.current_in, 1);
-
-      d.changed = false;  // Clear the flag after sending
+      obj["id"] = d.barcode != "" ? d.barcode : "mod#" + String(i + 1);
+      obj["watt"] = round(d.voltage_out * d.current_in);
+      obj["vin"] = d.voltage_in;
+      obj["vout"] = d.voltage_out;
+      obj["amp"] = d.current_in;
+      obj["temp"] = d.temperature;
+      obj["rssi"] = d.rssi;
+      obj["barcode"] = d.barcode;
+      obj["addr"] = d.addr;
+      d.changed = false;
     }
   }
-
   if (array.size() > 0) {
     String json;
     serializeJson(array, json);
     ws.textAll(json);
   }
 }
-
-
 
 void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_CONNECT) {
@@ -211,9 +189,6 @@ void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsE
     WebSerial.printf("WebSocket client disconnected: %u\n", client->id());
   }
 }
-
-
-
 
 void initWiFi() {
   WiFi.disconnect();
@@ -236,8 +211,8 @@ void setup() {
   Serial1.begin(38400, SERIAL_8N1, RX_PIN, TX_PIN);
   generateCRCTable();  // Generate the CRC lookup table
   initWiFi();
+  setupNTP(); 
   setupWebserver();
-
   WebSerial.begin(&server);
   server.begin();
   MQTT_Client.setServer(MQTT_BROKER, 1883);
@@ -245,50 +220,40 @@ void setup() {
   ArduinoOTA.begin();
   SPIFFS.begin(true);
   loadNodeTable();
-
 }
 
-
-
-
-
 void loop() {
-  // put your main code here, to run repeatedly:
   currentMillis = millis();
   ArduinoOTA.handle();
   MQTT_Client.loop();
   yield();
   delay(10);
-  static String incomingData = "";
 
+  static String incomingData = "";
   static bool frameStarted = false;
+  static bool barcodeSaved = false;
 
   if(WiFi.status() == WL_CONNECTED){
     if(!MQTT_Client.connected()){
-      MQTT_Client.connect(hostname);
-      //delay(500);
-      //Serial.println(WiFi.localIP()); Willkommensnachricht an MQTT Server
+      MQTT_Client.connect(hostname, mqtt_user, mqtt_pass);
       WebSerial.println(WiFi.localIP());
       sprintf(address_complete, "%s%s%s", "TIGO/server/", WiFi.localIP().toString().c_str(),"/startup");
       MQTT_Client.publish(address_complete, "Hello");
     }
   }
+
   if (currentMillis - previousMillis >= interval) {
     previousMillis = currentMillis;
     WebsocketSend();
-}
-
 
 
 while (Serial1.available()) {
         char incomingByte = Serial1.read();
         incomingData += incomingByte;
-
         // Check if frame starts
         if (!frameStarted && incomingData.endsWith("\x7E\x08")) {
           WebSerial.println("Paket verpasst!");
         }
-
         if (!frameStarted && incomingData.endsWith("\x7E\x07")) {
             // Start of a new frame detected
             frameStarted = true;
@@ -315,10 +280,17 @@ while (Serial1.available()) {
             frameStarted = false;
             WebSerial.println("Buffer zu klein!");
         }
-
     }
-}
+    loopLogging();
 
+    if (!barcodeSaved && allBarcodesKnown()) {
+      saveNodeTable();  // salva la NodeTable
+      NodeTable_changed = false;
+      barcodeSaved = true;
+      Serial.println("NodeTable saved automatically.");
+    }
+  }
+}
 
 
 void loadNodeTable() {
@@ -327,25 +299,20 @@ void loadNodeTable() {
     Serial.println("Failed to open file for reading");
     return;
   }
-
   StaticJsonDocument<8192> doc;
   DeserializationError error = deserializeJson(doc, file);
   if (error) {
     Serial.println("Failed to parse JSON");
     return;
   }
-
   NodeTable_count = 0;
   memset(NodeTable, 0, sizeof(NodeTable));
-
-
   for (JsonObject obj : doc.as<JsonArray>()) {
     if (NodeTable_count < 100) {
       NodeTable[NodeTable_count].longAddress = obj["longAddress"].as<String>();
       NodeTable[NodeTable_count].addr = obj["addr"].as<String>();
       NodeTable[NodeTable_count].checksum = computeTigoCRC4(obj["addr"].as<String>().c_str());
       NodeTable_count++;
-
       bool found = false;
       for (int i = 0; i < deviceCount; i++) {
         if (devices[i].addr == obj["addr"].as<String>()) {
@@ -362,15 +329,9 @@ void loadNodeTable() {
       }
 
     }
-
-  
-
   }
-
   file.close();
 }
-
-
 
 void saveNodeTable() {
   File file = SPIFFS.open("/nodetable.json", "w");
@@ -378,16 +339,13 @@ void saveNodeTable() {
     Serial.println("Failed to open file for writing");
     return;
   }
-
   StaticJsonDocument<8192> doc;
   JsonArray arr = doc.to<JsonArray>();
-
   for (int i = 0; i < NodeTable_count; i++) {
     JsonObject obj = arr.createNestedObject();
     obj["longAddress"] = NodeTable[i].longAddress;
     obj["addr"] = NodeTable[i].addr;
   }
-
   if (serializeJsonPretty(doc, file) == 0) {
     Serial.println("Failed to write JSON");
   }
@@ -412,16 +370,10 @@ String frameToHexString(const String& frame) {
   return hexStr;
 }
 
-
-
-
-
 void process09frame(String frame){
   String addr = frame.substring(14,18);
   String node_id = frame.substring(18,22);
   String barcode = frame.substring(40,46);
-
-
   bool found = false;
   for(int i=0; i < frame09_count; i++){
     if (frame09[i].barcode = barcode){
@@ -448,7 +400,6 @@ void process27frame(String frame){
     String longAddr = frame.substring(pos, pos + 16);
     String addr = frame.substring(pos + 16, pos + 20);
     pos += 20;
-
     bool found = false;
     for (int j = 0; j < NodeTable_count; j++) {
       if (NodeTable[j].longAddress == longAddr) {
@@ -462,7 +413,6 @@ void process27frame(String frame){
         break;
       }
     }
-
     if (!found && NodeTable_count < 100) {
       // Add new entry
       NodeTable[NodeTable_count].longAddress = longAddr;
@@ -476,9 +426,8 @@ void process27frame(String frame){
 
 void processPowerFrame(String frame) {
   // pv_node_id (2 bytes)
-
   String addr = frame.substring(2, 6);   // Example: "001A"
-  
+
   // Address (2 bytes)
   String pv_node_id = frame.substring(6, 10);        // Example: "000F"
   
@@ -537,9 +486,7 @@ void processPowerFrame(String frame) {
       break;
     }
   }
-
   // If device is new, add it to the list
-  
   if (!found && deviceCount < 100) {
     for (int j = 0; j < NodeTable_count; j++) {
       if (NodeTable[j].addr == addr) {
@@ -584,24 +531,17 @@ int calculateHeaderLength(String hexFrame) {
   return length;
 }
 
-
 void processFrame(String frame) {
     frame = removeEscapeSequences(frame);
-
     if (verifyChecksum(frame)) {
       //Checksum is valid so remove it
-
-
       frame = frame.substring(0, frame.length() - 2);
       String hexFrame = frameToHexString(frame);
-
-
       if (hexFrame.length() >= 10) {
         String segment = hexFrame.substring(4, 8); // Get substring from position 5 to 8 (0-based index)
         String slot_counter = "";
         int start_payload = 0;
         //Sortieren nach Typen:
-      
         if (segment == "0149") {
           //WebSerial.println("Gesamt: " + hexFrame);
           //gefunden dann den Header anschauen:
@@ -654,12 +594,10 @@ void processFrame(String frame) {
             }else{
               WebSerial.println("Unbekannt: " + packet);
             }
-
             // Weiter zum nächsten Paket
             pos += packetLengthInChars;
             i = i + 1;
           }
-
         }else if(segment == "0B10" || segment == "0B0F"){
           //Command request or Response
           String type = hexFrame.substring(14, 16);
@@ -694,13 +632,10 @@ void processFrame(String frame) {
         }
       }
       // Further processing here...
-
     } else {
       WebSerial.println("Checksum Invalid" + frameToHexString(frame));
     }
 }
-
-
 
 String removeEscapeSequences(const String& frame) {
     String result = "";
@@ -728,4 +663,117 @@ String removeEscapeSequences(const String& frame) {
         }
     }
     return result;
+}
+
+unsigned long lastLogTime = 0;
+const unsigned long logInterval = 30000; // 30 seconds
+
+String getDateFilename() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "/log_unknown.json";
+  char buf[32];
+  strftime(buf, sizeof(buf), "/log_%Y-%m-%d.json", &timeinfo);
+  return String(buf);
+}
+
+String getTimestampISO8601() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "1970-01-01T00:00:00";
+  char buf[25];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
+void logAllDevices() {
+  String filename = getDateFilename();
+  File file = SPIFFS.open(filename, FILE_APPEND);
+  if (!file) return;
+  String timestamp = getTimestampISO8601();
+  for (int i = 0; i < deviceCount; i++) {
+    int watt = round(devices[i].voltage_out * devices[i].current_in);
+    String line = "{";
+    line += "\"ts\":\"" + timestamp + "\",";
+    line += "\"barcode\":\"" + devices[i].barcode + "\",";
+    line += "\"vin\":" + String(devices[i].voltage_in, 2) + ",";
+    line += "\"vout\":" + String(devices[i].voltage_out, 2) + ",";
+    line += "\"amp\":" + String(devices[i].current_in, 2) + ",";
+    line += "\"watt\":" + String(watt) + ",";
+    line += "\"temp\":" + String(devices[i].temperature, 1);
+    line += "}\n";
+    file.print(line);
+  }
+  file.close();
+}
+
+// Inserire nel setup() dopo la connessione WiFi:
+void setupNTP() {
+  setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+  tzset();
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  struct tm timeinfo;
+  while (!getLocalTime(&timeinfo)) {
+    Serial.println("Sync NTP...");
+    delay(1000);
+  }
+}
+
+// Aggiungere nel loop principale:
+void loopLogging() {
+  static unsigned long lastLogTime = 0;
+  unsigned long now = millis();
+  if (now - lastLogTime < 30000) return;
+  lastLogTime = now;
+
+  time_t t = time(nullptr);
+  struct tm *tmstruct = localtime(&t);
+  char filename[32];
+  snprintf(filename, sizeof(filename), "/log_%04d-%02d-%02d.json", tmstruct->tm_year + 1900, tmstruct->tm_mon + 1, tmstruct->tm_mday);
+
+  // Limita a 7 file log
+  std::vector<String> logFiles;
+  File root = SPIFFS.open("/");
+  File file = root.openNextFile();
+  while (file) {
+    String name = file.name();
+    if (name.startsWith("/log_")) {
+      logFiles.push_back(name);
+    }
+    file = root.openNextFile();
+  }
+  if (logFiles.size() > 7) {
+    std::sort(logFiles.begin(), logFiles.end());
+    for (size_t i = 0; i < logFiles.size() - 7; ++i) {
+      SPIFFS.remove(logFiles[i]);
+    }
+  }
+
+  File logFile = SPIFFS.open(filename, FILE_APPEND);
+  if (!logFile) return;
+
+  char ts[25];
+  strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", tmstruct);
+  String json = "{\"ts\":\"" + String(ts) + "\",\"modules\":{";
+
+  for (int i = 0; i < deviceCount; i++) {
+    if (i > 0) json += ",";
+    json += "\"" + String(devices[i].barcode) + "\":{";
+    json += "\"vin\":" + String(devices[i].voltage_in, 2);
+    json += ",\"vout\":" + String(devices[i].voltage_out, 2);
+    json += ",\"amp\":" + String(devices[i].current_in, 2);
+    json += ",\"watt\":" + String(round(devices[i].voltage_out * devices[i].current_in));
+    json += ",\"temp\":" + String(devices[i].temperature, 1);
+    json += "}";
+  }
+  json += "}}\n";
+  logFile.print(json);
+  logFile.close();
+}
+
+bool allBarcodesKnown() {
+  for (int i = 0; i < deviceCount; i++) {
+    if (devices[i].barcode.length() < 5) {
+      return false;
+    }
+  }
+  return true;
 }

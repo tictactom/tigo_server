@@ -1,82 +1,109 @@
-
-void setupWebserver(){
+void setupWebserver() {
   handleRoot();
   ws.onEvent(onWebSocketEvent);
   server.addHandler(&ws);
   server.serveStatic("/", SPIFFS, "/").setDefaultFile("index.html");
+
   server.on("/spiffs", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/html", generateFileListHTML());
   });
+
   handleFileUpload();
 
-    server.on("/delete", HTTP_GET, [](AsyncWebServerRequest *request) {
+  server.on("/delete", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (request->hasParam("file")) {
       String fileToDelete = request->getParam("file")->value();
       if (SPIFFS.exists(fileToDelete)) {
         if (SPIFFS.remove(fileToDelete)) {
-          // Nach Löschen zurück zur Liste
-          request->redirect("/spiffs");
+          request->redirect("/spiffs");  // After deletion, return to file list
         } else {
-          request->send(500, "text/plain", "Fehler beim Löschen der Datei");
+          request->send(500, "text/plain", "Error deleting file");
         }
       } else {
-        request->send(404, "text/plain", "Datei nicht gefunden");
+        request->send(404, "text/plain", "File not found");
       }
     } else {
-      request->send(400, "text/plain", "Fehlender Parameter: file");
+      request->send(400, "text/plain", "Missing parameter: file");
     }
   });
 
-    // Route zum Herunterladen der Datei
   server.on("/download", HTTP_GET, [](AsyncWebServerRequest *request) {
-  if (request->hasParam("file")) {
-    String filePath = request->getParam("file")->value();
-
-    if (SPIFFS.exists(filePath)) {
-      File downloadFile = SPIFFS.open(filePath, "r");
-      AsyncWebServerResponse *response = request->beginResponse(
-        "application/octet-stream",
-        downloadFile.size(),
-        [downloadFile](uint8_t *buffer, size_t maxLen, size_t index) mutable -> size_t {
-          return downloadFile.read(buffer, maxLen);
-        }
-      );
-
-      // Dateiname extrahieren (alles nach dem letzten Slash)
-      String filename = filePath.substring(filePath.lastIndexOf('/') + 1);
-      response->addHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
-
-      request->send(response);
+    if (request->hasParam("file")) {
+      String filePath = request->getParam("file")->value();
+      if (SPIFFS.exists(filePath)) {
+        File downloadFile = SPIFFS.open(filePath, "r");
+        AsyncWebServerResponse *response = request->beginResponse(
+          "application/octet-stream",
+          downloadFile.size(),
+          [downloadFile](uint8_t *buffer, size_t maxLen, size_t index) mutable -> size_t {
+            return downloadFile.read(buffer, maxLen);
+          }
+        );
+        String filename = filePath.substring(filePath.lastIndexOf('/') + 1);
+        response->addHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+        request->send(response);
+      } else {
+        request->send(404, "text/plain", "File not found");
+      }
     } else {
-      request->send(404, "text/plain", "Datei nicht gefunden");
+      request->send(400, "text/plain", "Missing parameter: file");
     }
-  } else {
-    request->send(400, "text/plain", "Fehlender Parameter: file");
-  }
-});
-
+  });
 
   server.on("/save", HTTP_GET, [](AsyncWebServerRequest *request){
     saveNodeTable();
     NodeTable_changed = false;
-    request->send(200, "text/plain", "NodeTable gespeichert.");
+    request->send(200, "text/plain", "NodeTable saved.");
+  });
+
+  server.on("/logs", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(SPIFFS, "/logviewer.html", "text/html");
+  });
+
+  server.on("/listlogs", HTTP_GET, [](AsyncWebServerRequest *request){
+    String json = "[";
+    File root = SPIFFS.open("/");
+    File file = root.openNextFile();
+    bool first = true;
+    while (file) {
+      String name = file.name();
+      if (name.startsWith("log_")) {
+        if (!first) json += ",";
+        json += "\"" + name + "\"";
+        first = false;
+      }
+      file = root.openNextFile();
+    }
+    json += "]";
+    request->send(200, "application/json", json);
+  });
+
+  server.on("/logdata", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!request->hasParam("file")) {
+      request->send(400, "text/plain", "Missing file parameter");
+      return;
+    }
+    String file = request->getParam("file")->value();
+    if (!file.startsWith("/")) file = "/" + file;
+
+    if (!SPIFFS.exists(file)) {
+      request->send(404, "text/plain", "File not found");
+      return;
+    }
+
+    request->send(SPIFFS, file, "text/plain");
   });
 }
 
-
-
-
-
 String urlEncode(const String &str) {
   String encoded = "";
-  char buf[4]; // für %XX + \0
-
+  char buf[4]; // for %XX + \0
   for (size_t i = 0; i < str.length(); i++) {
     char c = str.charAt(i);
     if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
       encoded += c;
     } else {
-      sprintf(buf, "%%%02X", (unsigned char)c); // korrektes %2F z. B.
+      sprintf(buf, "%%%02X", (unsigned char)c); // correct encoding like %2F
       encoded += buf;
     }
   }
@@ -91,8 +118,13 @@ String fixPath(const String& path) {
 }
 
 String generateFileListHTML() {
-  String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>SPIFFS Dateien</title></head><body>";
-  html += "<h1>SPIFFS Dateiliste</h1><ul>";
+  size_t total = SPIFFS.totalBytes();
+  size_t used = SPIFFS.usedBytes();
+  size_t free = total - used;
+  size_t freeHeap = ESP.getFreeHeap();
+
+  String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>SPIFFS Files</title></head><body>";
+  html += "<h1>SPIFFS File List</h1><ul>";
 
   File root = SPIFFS.open("/");
   File file = root.openNextFile();
@@ -102,37 +134,31 @@ String generateFileListHTML() {
     size_t fsize = file.size();
     html += "<li>" + fname + " (" + String(fsize) + " Bytes) ";
     html += "<a href=\"/download?file=" + urlEncode(fname) + "\">[Download]</a> ";
-    html += "<a href=\"/delete?file=" + urlEncode(fname) + "\" onclick=\"return confirm('Datei löschen?');\">[Löschen]</a>";
+    html += "<a href=\"/delete?file=" + urlEncode(fname) + "\" onclick=\"return confirm('Delete this file?');\">[Delete]</a>";
     html += "</li>";
     file = root.openNextFile();
   }
 
   html += "</ul>";
-  html += "<a href=\"/spiffs\">Seite aktualisieren</a><br><br>";
+  html += "<p><b>SPIFFS Usage:</b> " + String(used) + " / " + String(total) + " Bytes used (" + String(free) + " free)</p>";
+  html += "<p><b>Free RAM:</b> " + String(freeHeap) + " Bytes</p>";
+  html += "<a href=\"/spiffs\">Refresh Page</a><br><br>";
   html += "<form method=\"POST\" action=\"/save_upload\" enctype=\"multipart/form-data\">";
   html += "<input type=\"file\" name=\"upload\"><br><br>";
-  html += "<input type=\"submit\" value=\"Hochladen\">";
+  html += "<input type=\"submit\" value=\"Upload\">";
   html += "</form>";
   html += "</body></html>";
 
   return html;
 }
 
-
-
-
 void handleRoot() {
   server.on("/debug", HTTP_GET, [](AsyncWebServerRequest *request){
     String htmlContent = "<html><head><title>Tigo Data</title></head><body>";
     htmlContent += "<h1>Tigo Data</h1>"; 
-
-    htmlContent += "<table border='1'><tr><th>Nr.</th><th>PV Node ID</th><th>Addr</th><th>Voltage In</th><th>Voltage Out</th><th>Duty Cycle</th><th>Current In</th><th>Watt</th><th>Temperature</th><th>Slot Counter</th><th>RSSI</th><th>Barcode</th></tr>";
+    htmlContent += "<table border='1'><tr><th>No.</th><th>PV Node ID</th><th>Addr</th><th>Voltage In</th><th>Voltage Out</th><th>Duty Cycle</th><th>Current In</th><th>Watt</th><th>Temperature</th><th>Slot Counter</th><th>RSSI</th><th>Barcode</th></tr>";
 
     for (int i = 0; i < deviceCount; i++) {
-      String barcode_nodeTable = "n/a";
-      
-
-
       htmlContent += "<tr>";
       htmlContent += "<td>" + String(i+1) + "</td>";
       htmlContent += "<td>" + devices[i].pv_node_id + "</td>";
@@ -143,16 +169,16 @@ void handleRoot() {
       htmlContent += "<td>" + String(devices[i].current_in, 2) + " A</td>";
       int watt = round(devices[i].voltage_out * devices[i].current_in);
       htmlContent += "<td>" + String(watt) + " W</td>";
-      htmlContent += "<td>" + String(devices[i].temperature, 1) + " C</td>";
+      htmlContent += "<td>" + String(devices[i].temperature, 1) + " °C</td>";
       htmlContent += "<td>" + devices[i].slot_counter + "</td>";
       htmlContent += "<td>" + String(devices[i].rssi) + "</td>";
       htmlContent += "<td>" + devices[i].barcode + "</td>";
       htmlContent += "</tr>";
     }
-    htmlContent += "</table><br><br>";
-    htmlContent += "<h1>NodeTable</h1>";
-    htmlContent += "<table border='1'><tr><th>Nr.</th><th>Addr</th><th>LongAddress</th></tr>";
 
+    htmlContent += "</table><br><br>";
+    htmlContent += "<h1>Node Table</h1>";
+    htmlContent += "<table border='1'><tr><th>No.</th><th>Addr</th><th>Long Address</th><th>Checksum</th></tr>";
 
     for (int i = 0; i < NodeTable_count; i++){
       htmlContent += "<tr>";
@@ -162,31 +188,28 @@ void handleRoot() {
       htmlContent += "<td>" + NodeTable[i].checksum + "</td>";
       htmlContent += "</tr>";
     }
+
     htmlContent += "</table><br><br>";
     if(NodeTable_changed){
-      htmlContent += "<b>Die NodeTable hat sich geändert und wurde noch nicht gespeichert!</b>";
+      htmlContent += "<b>The NodeTable has changed and has not been saved yet!</b>";
     }
-    htmlContent += "<br><a href='/save'><button>NodeTable speichern</button></a><br><br>";
+
+    htmlContent += "<br><a href='/save'><button>Save NodeTable</button></a><br><br>";
     htmlContent += "</body></html>";
 
     request->send(200, "text/html", htmlContent);
   });
 }
 
-
-
-
-
 void handleFileUpload() {
   server.on(
     "/save_upload", HTTP_POST,
     [](AsyncWebServerRequest *request) {
       request->redirect("/spiffs");
-      //request->send(200, "text/plain", "Datei erfolgreich hochgeladen");
     },
     [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
       if (!index) {
-        Serial.printf("Upload beginnt: %s\n", filename.c_str());
+        Serial.printf("Upload started: %s\n", filename.c_str());
         if (SPIFFS.exists("/" + filename)) {
           SPIFFS.remove("/" + filename);
         }
@@ -196,7 +219,7 @@ void handleFileUpload() {
         uploadFile.write(data, len);
       }
       if (final) {
-        Serial.printf("Upload abgeschlossen: %s (%u Bytes)\n", filename.c_str(), index + len);
+        Serial.printf("Upload complete: %s (%u Bytes)\n", filename.c_str(), index + len);
         if (uploadFile) uploadFile.close();
       }
     }

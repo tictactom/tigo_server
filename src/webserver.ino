@@ -3,11 +3,9 @@ void setupWebserver() {
   ws.onEvent(onWebSocketEvent);
   server.addHandler(&ws);
   server.serveStatic("/", SPIFFS, "/").setDefaultFile("index.html");
-
   server.on("/spiffs", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/html", generateFileListHTML());
   });
-
   handleFileUpload();
 
   server.on("/delete", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -15,7 +13,7 @@ void setupWebserver() {
       String fileToDelete = request->getParam("file")->value();
       if (SPIFFS.exists(fileToDelete)) {
         if (SPIFFS.remove(fileToDelete)) {
-          request->redirect("/spiffs");  // After deletion, return to file list
+          request->redirect("/spiffs");
         } else {
           request->send(500, "text/plain", "Error deleting file");
         }
@@ -50,13 +48,21 @@ void setupWebserver() {
     }
   });
 
+
+
+   server.on("/reboot", HTTP_POST, [](AsyncWebServerRequest *request){
+    request->send(200, "text/plain", "♻️ Rebooting ESP32...");
+    delay(100);
+    ESP.restart();
+  });
+  
   server.on("/save", HTTP_GET, [](AsyncWebServerRequest *request){
     saveNodeTable();
     NodeTable_changed = false;
     request->send(200, "text/plain", "NodeTable saved.");
   });
-
-  server.on("/logs", HTTP_GET, [](AsyncWebServerRequest *request){
+  
+    server.on("/logs", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(SPIFFS, "/logviewer.html", "text/html");
   });
 
@@ -124,6 +130,7 @@ String generateFileListHTML() {
   size_t freeHeap = ESP.getFreeHeap();
 
   String html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>SPIFFS Files</title></head><body>";
+  html += "<a href='#' onclick=\"fetch('/reboot', {method:'POST'}).then(()=>location.reload());\"><button>Reboot ESP32</button></a><br><br>";
   html += "<h1>SPIFFS File List</h1><ul>";
 
   File root = SPIFFS.open("/");
@@ -152,6 +159,9 @@ String generateFileListHTML() {
   return html;
 }
 
+
+
+
 void handleRoot() {
   server.on("/debug", HTTP_GET, [](AsyncWebServerRequest *request){
     String htmlContent = "<html><head><title>Tigo Data</title></head><body>";
@@ -159,6 +169,10 @@ void handleRoot() {
     htmlContent += "<table border='1'><tr><th>No.</th><th>PV Node ID</th><th>Addr</th><th>Voltage In</th><th>Voltage Out</th><th>Duty Cycle</th><th>Current In</th><th>Watt</th><th>Temperature</th><th>Slot Counter</th><th>RSSI</th><th>Barcode</th></tr>";
 
     for (int i = 0; i < deviceCount; i++) {
+      String barcode_nodeTable = "n/a";
+      
+
+
       htmlContent += "<tr>";
       htmlContent += "<td>" + String(i+1) + "</td>";
       htmlContent += "<td>" + devices[i].pv_node_id + "</td>";
@@ -175,7 +189,6 @@ void handleRoot() {
       htmlContent += "<td>" + devices[i].barcode + "</td>";
       htmlContent += "</tr>";
     }
-
     htmlContent += "</table><br><br>";
     htmlContent += "<h1>Node Table</h1>";
     htmlContent += "<table border='1'><tr><th>No.</th><th>Addr</th><th>Long Address</th><th>Checksum</th></tr>";
@@ -188,7 +201,6 @@ void handleRoot() {
       htmlContent += "<td>" + NodeTable[i].checksum + "</td>";
       htmlContent += "</tr>";
     }
-
     htmlContent += "</table><br><br>";
     if(NodeTable_changed){
       htmlContent += "<b>The NodeTable has changed and has not been saved yet!</b>";
@@ -201,25 +213,36 @@ void handleRoot() {
   });
 }
 
+
+
+
+
 void handleFileUpload() {
   server.on(
     "/save_upload", HTTP_POST,
     [](AsyncWebServerRequest *request) {
       request->redirect("/spiffs");
+      //request->send(200, "text/plain", "Datei erfolgreich hochgeladen");
     },
     [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
       if (!index) {
-        Serial.printf("Upload started: %s\n", filename.c_str());
-        if (SPIFFS.exists("/" + filename)) {
-          SPIFFS.remove("/" + filename);
+        Serial.printf("Upload beginnt: %s\n", filename.c_str());
+        String path = "/" + filename;
+        if (SPIFFS.totalBytes() - SPIFFS.usedBytes() < len) {
+          Serial.println("❌ Nicht genug Platz im SPIFFS.");
+          request->send(500, "text/plain", "❌ Not enough space on SPIFFS for file: " + filename);
+          return;
         }
-        uploadFile = SPIFFS.open("/" + filename, FILE_WRITE);
+        if (SPIFFS.exists(path)) {
+          SPIFFS.remove(path);
+        }
+        uploadFile = SPIFFS.open(path, FILE_WRITE);
       }
       if (uploadFile) {
         uploadFile.write(data, len);
       }
       if (final) {
-        Serial.printf("Upload complete: %s (%u Bytes)\n", filename.c_str(), index + len);
+        Serial.printf("Upload abgeschlossen: %s (%u Bytes)\n", filename.c_str(), index + len);
         if (uploadFile) uploadFile.close();
       }
     }

@@ -35,6 +35,11 @@ void loadNodeTable();
 void loopLogging();
 bool allBarcodesKnown();
 void saveNodeTable();
+void handleRoot();
+String generateFileListHTML();
+void handleFileUpload();
+
+File uploadFile;
 
 struct DeviceData {
   String pv_node_id;
@@ -73,8 +78,6 @@ WiFiClient espClient;
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 PubSubClient MQTT_Client(espClient);
-
-File uploadFile;
 
 unsigned long currentMillis = millis();
 unsigned long previousMillis = millis();
@@ -283,8 +286,9 @@ while (Serial1.available()) {
     }
     loopLogging();
 
-    if (!barcodeSaved && allBarcodesKnown()) {
-      saveNodeTable();  // salva la NodeTable
+    static bool barcodeSaved = false;
+    if (!barcodeSaved && allBarcodesKnown() && NodeTable_count >= deviceCount) {
+      saveNodeTable();
       NodeTable_changed = false;
       barcodeSaved = true;
       Serial.println("NodeTable saved automatically.");
@@ -334,24 +338,40 @@ void loadNodeTable() {
 }
 
 void saveNodeTable() {
-  File file = SPIFFS.open("/nodetable.json", "w");
-  if (!file) {
-    Serial.println("Failed to open file for writing");
+  WebSerial.println("🔄 Saving NodeTable...");
+
+  if (NodeTable_count == 0) {
+    WebSerial.println("⚠️ NodeTable is empty, nothing to save.");
     return;
   }
-  StaticJsonDocument<8192> doc;
+
+  SPIFFS.remove("/nodetable.json");  // ensure overwrite
+  File file = SPIFFS.open("/nodetable.json", "w");
+  
+  if (!file) {
+    WebSerial.println("❌ Failed to open /nodetable.json for writing.");
+    return;
+  }
+
+  StaticJsonDocument<4096> doc;
   JsonArray arr = doc.to<JsonArray>();
+
   for (int i = 0; i < NodeTable_count; i++) {
     JsonObject obj = arr.createNestedObject();
-    obj["longAddress"] = NodeTable[i].longAddress;
     obj["addr"] = NodeTable[i].addr;
+    obj["longAddress"] = NodeTable[i].longAddress;
+    obj["checksum"] = NodeTable[i].checksum;
   }
+
   if (serializeJsonPretty(doc, file) == 0) {
-    Serial.println("Failed to write JSON");
+    WebSerial.println("❌ Failed to write JSON to file.");
+  } else {
+    WebSerial.println("✅ NodeTable saved to /nodetable.json.");
   }
 
   file.close();
 }
+
 
 
 String byteToHex(byte b) {

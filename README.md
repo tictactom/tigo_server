@@ -48,9 +48,13 @@ The `/logs` interface lets you select a log file and timestamp, and see all modu
 - Based on the reverse-engineering work by [willglynn/taptap](https://github.com/willglynn/taptap)
 - This fork expands it into a full local monitoring platform with logs, real-time view, and persistence.
 
+## Image Config
+<img src="images/esp32-rs485.png" alt="esp32" width="400"/>
+<img src="images/stepdown-5v.png" alt="stepdown" width="400"/>
 ## 🔓 License
 
 MIT (feel free to adapt for your system)
 
 ---
+Tnx tictactom for great work (tictactom/tigo_server)
 Maintained by the community. Suggestions welcome.

@@ -9,6 +9,13 @@
 #include <ArduinoJson.h>
 #include <time.h>
 
+#define MAX_SIZE_BYTES (300 * 1024) // 300 KB
+#define MAX_LOG_FILE_SIZE 1100000  // in byte
+#define MAX_SPIFFS_USAGE 1250000  // soglia oltre cui inizia a cancellare
+
+unsigned long lastLogTime = 0;
+const unsigned long logInterval = 30000; // 30 seconds
+
 const char* hostname = "TigoServer";
 const char* ssid = ""; //SSID
 const char* password = ""; //passwort
@@ -19,7 +26,6 @@ const char* mqtt_pass = "";
 constexpr uint16_t POLYNOMIAL = 0x8408;  // Reversed polynomial (0x1021 reflected)
 constexpr size_t TABLE_SIZE = 256;
 uint16_t CRC_TABLE[TABLE_SIZE];
-
 
 #define RX_PIN 4  // Define the RX pin
 #define TX_PIN 5  // Define the TX pin
@@ -235,6 +241,11 @@ void loop() {
   static String incomingData = "";
   static bool frameStarted = false;
   static bool barcodeSaved = false;
+
+  if (millis() - lastLogTime >= logInterval) {
+    loopLogging();  // funzione esistente che scrive il log
+    lastLogTime = millis();
+  }
 
   if(WiFi.status() == WL_CONNECTED){
     if(!MQTT_Client.connected()){
@@ -685,9 +696,6 @@ String removeEscapeSequences(const String& frame) {
     return result;
 }
 
-unsigned long lastLogTime = 0;
-const unsigned long logInterval = 30000; // 30 seconds
-
 String getDateFilename() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return "/log_unknown.json";
@@ -737,57 +745,76 @@ void setupNTP() {
   }
 }
 
-// Aggiungere nel loop principale:
 void loopLogging() {
   static unsigned long lastLogTime = 0;
-  unsigned long now = millis();
-  if (now - lastLogTime < 30000) return;
-  lastLogTime = now;
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  unsigned long currentMillis = millis();
 
-  time_t t = time(nullptr);
-  struct tm *tmstruct = localtime(&t);
-  char filename[32];
-  snprintf(filename, sizeof(filename), "/log_%04d-%02d-%02d.json", tmstruct->tm_year + 1900, tmstruct->tm_mon + 1, tmstruct->tm_mday);
+  if (currentMillis - lastLogTime >= 30000) { // ogni 30s
+    lastLogTime = currentMillis;
 
-  // Limita a 7 file log
-  std::vector<String> logFiles;
-  File root = SPIFFS.open("/");
-  File file = root.openNextFile();
-  while (file) {
-    String name = file.name();
-    if (name.startsWith("/log_")) {
-      logFiles.push_back(name);
+    char filename[32];
+    strftime(filename, sizeof(filename), "/log_%Y-%m-%d.json", timeinfo);
+
+    // Controllo spazio
+    size_t used = SPIFFS.usedBytes();
+    if (used > MAX_SPIFFS_USAGE) {
+      File root = SPIFFS.open("/");
+      File oldestFile;
+      time_t oldestTime = now;
+
+      while (File entry = root.openNextFile()) {
+        String name = entry.name();
+        if (name.startsWith("/log_") && name.endsWith(".json")) {
+          struct tm tm{};
+          if (sscanf(name.c_str(), "/log_%d-%d-%d.json", &tm.tm_year, &tm.tm_mon, &tm.tm_mday) == 3) {
+            tm.tm_year -= 1900;
+            tm.tm_mon -= 1;
+            time_t fileTime = mktime(&tm);
+            if (fileTime < oldestTime) {
+              oldestTime = fileTime;
+              oldestFile = entry;
+            }
+          }
+        }
+      }
+      if (oldestFile) {
+        Serial.println("❌ SPIFFS quasi pieno. Elimino: " + String(oldestFile.name()));
+        SPIFFS.remove(oldestFile.name());
+      }
     }
-    file = root.openNextFile();
-  }
-  if (logFiles.size() > 7) {
-    std::sort(logFiles.begin(), logFiles.end());
-    for (size_t i = 0; i < logFiles.size() - 7; ++i) {
-      SPIFFS.remove(logFiles[i]);
+
+    File logFile = SPIFFS.open(filename, FILE_APPEND);
+    if (!logFile) return;
+
+    if (logFile.size() > MAX_LOG_FILE_SIZE) {
+      logFile.close();
+      Serial.println("📦 File troppo grande. Non si scrive.");
+      return;
     }
+
+    StaticJsonDocument<2048> doc;
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", timeinfo);
+    String json = "{\"ts\":\"" + String(timestamp) + "\",\"modules\":{";
+
+    for (int i = 0; i < deviceCount; i++) {
+      if (i > 0) json += ",";
+      json += "\"" + String(devices[i].barcode) + "\":{";
+      json += "\"vin\":" + String(devices[i].voltage_in, 2);
+      json += ",\"vout\":" + String(devices[i].voltage_out, 2);
+      json += ",\"amp\":" + String(devices[i].current_in, 2);
+      json += ",\"watt\":" + String(round(devices[i].voltage_out * devices[i].current_in));
+      json += ",\"temp\":" + String(devices[i].temperature, 1);
+      json += "}";
+    }
+    json += "}}\n";
+    logFile.print(json);
+    logFile.close();
   }
-
-  File logFile = SPIFFS.open(filename, FILE_APPEND);
-  if (!logFile) return;
-
-  char ts[25];
-  strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", tmstruct);
-  String json = "{\"ts\":\"" + String(ts) + "\",\"modules\":{";
-
-  for (int i = 0; i < deviceCount; i++) {
-    if (i > 0) json += ",";
-    json += "\"" + String(devices[i].barcode) + "\":{";
-    json += "\"vin\":" + String(devices[i].voltage_in, 2);
-    json += ",\"vout\":" + String(devices[i].voltage_out, 2);
-    json += ",\"amp\":" + String(devices[i].current_in, 2);
-    json += ",\"watt\":" + String(round(devices[i].voltage_out * devices[i].current_in));
-    json += ",\"temp\":" + String(devices[i].temperature, 1);
-    json += "}";
-  }
-  json += "}}\n";
-  logFile.print(json);
-  logFile.close();
 }
+
 
 bool allBarcodesKnown() {
   for (int i = 0; i < deviceCount; i++) {
@@ -796,4 +823,35 @@ bool allBarcodesKnown() {
     }
   }
   return true;
+}
+
+
+void ensureFreeSpace() {
+  size_t used = SPIFFS.usedBytes();
+  size_t total = SPIFFS.totalBytes();
+  if ((total - used) < 10 * 1024) { // meno di 10 KB liberi
+    File root = SPIFFS.open("/");
+    String oldestLog;
+    time_t oldestTime = time(nullptr);
+
+    File file = root.openNextFile();
+    while (file) {
+      String name = file.name();
+      if (name.startsWith("/log_") && name.endsWith(".json")) {
+        struct stat file_stat;
+        if (!stat(("/spiffs" + name).c_str(), &file_stat)) {
+          if (file_stat.st_mtime < oldestTime) {
+            oldestTime = file_stat.st_mtime;
+            oldestLog = name;
+          }
+        }
+      }
+      file = root.openNextFile();
+    }
+
+    if (oldestLog.length()) {
+      SPIFFS.remove(oldestLog);
+      Serial.println("🗑️ Cancellato file log più vecchio: " + oldestLog);
+    }
+  }
 }
